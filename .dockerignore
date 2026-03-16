@@ -1,0 +1,11 @@
+﻿node_modules
+.next
+.env*
+data/*.db
+data/*.db-shm
+data/*.db-wal
+npm-debug.log*
+*.log
+Dockerfile*
+docker-compose*.yml
+README.md

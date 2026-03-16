@@ -1,0 +1,11 @@
+services:
+  app:
+    build: .
+    ports:
+      - "3003:3000"
+    environment:
+      - PORT=3000
+      - HOSTNAME=0.0.0.0
+      - ORDER_TRACKER_DB_PATH=/app/data/orders.db
+    volumes:
+      - ./data:/app/data
