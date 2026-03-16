@@ -1,8 +1,9 @@
 ﻿'use server';
 
 import { revalidatePath } from "next/cache";
+import { redirect } from "next/navigation";
 import * as XLSX from "xlsx";
-import { listOrders, normalizeBoolean, normalizeNullableNumber, saveOrderRecord, upsertOrdersBulk } from "@/lib/db";
+import { createBackup, listOrders, normalizeBoolean, normalizeNullableNumber, saveOrderRecord, setAppSetting, upsertOrdersBulk } from "@/lib/db";
 import { deriveOrder } from "@/lib/order-logic";
 import { ExportableField, FinalPaymentRule, OrderRecord } from "@/lib/types";
 
@@ -155,6 +156,7 @@ export async function saveOrderAction(formData: FormData) {
   saveOrderRecord(payload, originalContactNo || undefined);
   revalidatePath("/");
   revalidatePath("/orders");
+  revalidatePath("/settings");
   if (originalContactNo && originalContactNo !== contact_no) revalidatePath(`/orders/${originalContactNo}`);
   revalidatePath(`/orders/${contact_no}`);
 }
@@ -165,11 +167,14 @@ export async function deleteOrderAction(contactNo: string) {
   deleteOrder(contactNo);
   revalidatePath("/");
   revalidatePath("/orders");
+  revalidatePath("/settings");
 }
 
 export async function importOrdersAction(formData: FormData): Promise<void> {
   const file = formData.get("file");
   if (!(file instanceof File)) throw new Error("请选择 xlsx / csv 文件");
+
+  createBackup("before-import");
 
   const buffer = Buffer.from(await file.arrayBuffer());
   const lowerName = file.name.toLowerCase();
@@ -191,7 +196,27 @@ export async function importOrdersAction(formData: FormData): Promise<void> {
   revalidatePath("/");
   revalidatePath("/orders");
   revalidatePath("/import-export");
+  revalidatePath("/settings");
   console.log(`Imported ${toImport.length} orders from ${lowerName}`);
+}
+
+export async function createManualBackupAction() {
+  createBackup("manual");
+  revalidatePath("/settings");
+  redirect("/settings?backup=created");
+}
+
+export async function saveBackupSettingsAction(formData: FormData) {
+  const autoEnabled = normalizeBoolean(pickText(formData, "backup_auto_enabled"), 0);
+  const intervalHours = Math.max(1, Number(pickText(formData, "backup_interval_hours")) || 24);
+  const keepCount = Math.max(1, Number(pickText(formData, "backup_keep_count")) || 20);
+
+  setAppSetting("backup_auto_enabled", String(autoEnabled));
+  setAppSetting("backup_interval_hours", String(intervalHours));
+  setAppSetting("backup_keep_count", String(keepCount));
+
+  revalidatePath("/settings");
+  redirect("/settings?settings=saved");
 }
 
 export async function exportOrdersAction(formData: FormData) {

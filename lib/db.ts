@@ -4,7 +4,10 @@ import path from "node:path";
 import { OrderRecord } from "@/lib/types";
 
 const dbPath = process.env.ORDER_TRACKER_DB_PATH || path.join(process.cwd(), "data", "orders.db");
-fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+const dataDir = path.dirname(dbPath);
+const backupDir = path.join(dataDir, "backups");
+fs.mkdirSync(dataDir, { recursive: true });
+fs.mkdirSync(backupDir, { recursive: true });
 
 const db = new Database(dbPath);
 db.pragma("journal_mode = WAL");
@@ -78,6 +81,8 @@ if (!orderColumns.some((column) => column.name === "is_pinned")) {
 }
 
 const nowText = () => new Date().toISOString();
+const IS_BUILD_PHASE = process.env.NEXT_PHASE === "phase-production-build";
+let autoBackupCheckedAt = 0;
 
 export const ORDER_FIELDS: Array<keyof OrderRecord> = ["contract_date", "contract_no", "customer_name", "country", "contact_no", "material_no", "product_name", "spec", "batch_no", "package_form", "quality_standard", "unit_price", "quantity", "contract_amount", "export_type", "region", "internal_contract_no", "raw_material_request_date", "package_confirm_date", "prepayment_received_date", "contact_approval_done_date", "customer_extra_due_date", "computed_due_date", "planned_production_date", "actual_production_done_date", "shipped_date", "invoice_done_date", "contract_remit_date", "final_payment_received_date", "need_prepayment", "final_payment_rule", "completed_requires_final_payment", "notes", "last_follow_up_date", "is_key_order", "is_pinned", "custom_tags", "stage_override", "created_at", "updated_at"];
 
@@ -119,15 +124,96 @@ export function normalizeDateInput(value: unknown) {
   return date.toISOString().slice(0, 10);
 }
 
+export function getAppSetting(key: string) {
+  const row = db.prepare("SELECT value FROM app_settings WHERE key = ?").get(key) as { value: string } | undefined;
+  return row?.value ?? null;
+}
+
+export function setAppSetting(key: string, value: string) {
+  db.prepare(`
+    INSERT INTO app_settings (key, value)
+    VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+  `).run(key, value);
+}
+
+function formatBackupTimestamp(date = new Date()) {
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
+}
+
+function sanitizeBackupReason(reason: string) {
+  return reason.toLowerCase().replace(/[^a-z0-9-_]+/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "") || "manual";
+}
+
+export function listBackups() {
+  if (!fs.existsSync(backupDir)) return [] as Array<{ fileName: string; size: number; modifiedAt: string }>;
+  return fs.readdirSync(backupDir)
+    .filter((fileName) => fileName.endsWith(".db"))
+    .map((fileName) => {
+      const fullPath = path.join(backupDir, fileName);
+      const stat = fs.statSync(fullPath);
+      return { fileName, size: stat.size, modifiedAt: stat.mtime.toISOString() };
+    })
+    .sort((a, b) => b.modifiedAt.localeCompare(a.modifiedAt));
+}
+
+function cleanupOldBackups() {
+  const keepCount = Math.max(1, Number(getAppSetting("backup_keep_count") || "20") || 20);
+  const backups = listBackups();
+  for (const backup of backups.slice(keepCount)) {
+    fs.rmSync(path.join(backupDir, backup.fileName), { force: true });
+  }
+}
+
+export function createBackup(reason = "manual") {
+  const fileBase = path.basename(dbPath, path.extname(dbPath));
+  const backupName = `${fileBase}-${sanitizeBackupReason(reason)}-${formatBackupTimestamp()}.db`;
+  const backupPath = path.join(backupDir, backupName);
+
+  try {
+    db.pragma("wal_checkpoint(TRUNCATE)");
+  } catch {
+    db.pragma("wal_checkpoint(PASSIVE)");
+  }
+
+  fs.copyFileSync(dbPath, backupPath);
+  cleanupOldBackups();
+  setAppSetting("backup_last_run_at", nowText());
+  setAppSetting("backup_last_file", backupName);
+  return { fileName: backupName, fullPath: backupPath };
+}
+
+function maybeRunScheduledBackup() {
+  if (IS_BUILD_PHASE) return;
+
+  const now = Date.now();
+  if (now - autoBackupCheckedAt < 60_000) return;
+  autoBackupCheckedAt = now;
+
+  const enabled = getAppSetting("backup_auto_enabled") === "1";
+  if (!enabled) return;
+
+  const intervalHours = Math.max(1, Number(getAppSetting("backup_interval_hours") || "24") || 24);
+  const lastRunAt = getAppSetting("backup_last_run_at");
+  const lastRunMs = lastRunAt ? new Date(lastRunAt).getTime() : 0;
+  if (lastRunMs && now - lastRunMs < intervalHours * 3600_000) return;
+
+  createBackup("auto");
+}
+
 export function listOrders(): OrderRecord[] {
+  maybeRunScheduledBackup();
   return db.prepare("SELECT * FROM orders ORDER BY updated_at DESC").all() as OrderRecord[];
 }
 
 export function getOrder(contactNo: string): OrderRecord | undefined {
+  maybeRunScheduledBackup();
   return db.prepare("SELECT * FROM orders WHERE contact_no = ?").get(contactNo) as OrderRecord | undefined;
 }
 
 export function deleteOrder(contactNo: string): boolean {
+  maybeRunScheduledBackup();
   const removeOrder = db.transaction((targetContactNo: string) => {
     db.prepare("DELETE FROM order_batches WHERE contact_no = ?").run(targetContactNo);
     return db.prepare("DELETE FROM orders WHERE contact_no = ?").run(targetContactNo);
@@ -241,10 +327,12 @@ const upsertStatement = db.prepare(`
 `);
 
 export function upsertOrder(input: Partial<OrderRecord> & { contact_no: string }) {
+  maybeRunScheduledBackup();
   upsertStatement.run(buildOrderPayload(input));
 }
 
 export function saveOrderRecord(input: Partial<OrderRecord> & { contact_no: string }, originalContactNo?: string) {
+  maybeRunScheduledBackup();
   const save = db.transaction((nextInput: Partial<OrderRecord> & { contact_no: string }, previousContactNo?: string) => {
     const nextContactNo = nextInput.contact_no.trim();
     const sourceContactNo = previousContactNo?.trim();
@@ -261,6 +349,7 @@ export function saveOrderRecord(input: Partial<OrderRecord> & { contact_no: stri
 }
 
 export function upsertOrdersBulk(inputs: Array<Partial<OrderRecord> & { contact_no: string }>) {
+  maybeRunScheduledBackup();
   const bulkInsert = db.transaction((rows: Array<Partial<OrderRecord> & { contact_no: string }>) => {
     for (const row of rows) upsertStatement.run(buildOrderPayload(row));
   });
@@ -281,4 +370,5 @@ export function seedDemoData() {
 
 if (process.env.NODE_ENV !== "production") seedDemoData();
 
+export { backupDir, dbPath };
 export default db;
